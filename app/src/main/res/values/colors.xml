@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 与设计稿 surface 一致，用于启动窗口背景，避免冷启动闪白/闪黑 -->
+    <color name="app_surface">#FCFCFF</color>
+</resources>
