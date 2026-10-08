@@ -145,9 +145,10 @@ keyPassword=<你的密码>
 
 本项目能存在，完全是因为 [celesWuff/waterctl](https://github.com/celesWuff/waterctl)
 把整套协议逆向并开源了出来 —— 包括那段晦涩但精巧的密钥算法。请给原项目一个 star。
-本项目能被创作出来并上架，完全感谢我家亲爱的大肥鱼，这个项目几乎全权让它负责，甚至Readme也是（这句话不是），看着这些很像人话的Readme，让我明白了，**我们家大肥鱼也不是吃白饭的！！！**
-![Uploading 84a6071ce2efb7673d199abf628f4229.jpg…]()
 
+本项目能被创作出来并上架，完全感谢我家亲爱的大肥鱼，这个项目几乎全权让它负责，甚至Readme也是（这句话不是），看着这些很像人话的Readme，让我明白了，**我们家大肥鱼也不是吃白饭的！！！**
+
+<img src="docs/fatfish.jpg" width="196" alt="大肥鱼">
 
 ## 许可
 
