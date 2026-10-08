@@ -19,6 +19,15 @@
 
 ---
 
+## 下载
+
+不想自己编译的话，直接去 [**Releases**](https://github.com/bybixi/aquakey/releases/latest) 下载 APK 装到手机上就行。
+
+- 系统要求：Android 8.0（API 26）及以上
+- 体积：2.1 MB
+- 首次安装需要在系统设置里允许「安装未知来源的应用」
+- 每个 Release 里都附了 APK 与签名证书的 SHA-256，可自行核对
+
 ## 截图
 
 | 主界面 | 连接中 | 使用中 | 用水记录 |
