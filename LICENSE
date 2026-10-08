@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 bybixi (Android 原生实现)
+Copyright (c) 2026 bybixi (沐控 / AquaKey —— Android 原生实现)
 Copyright (c) 2021-2024 celesWuff, Deputy (水控器通信协议、密钥算法与报文格式)
 
 本项目的通信协议实现是 https://github.com/celesWuff/waterctl 的衍生作品。
