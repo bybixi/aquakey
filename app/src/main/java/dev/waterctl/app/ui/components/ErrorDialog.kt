@@ -111,7 +111,7 @@ fun ErrorDialog(
                 ) {
                     Text(
                         text = "调试信息",
-                        style = AppTypo.labelMedium.copy(fontFamily = AppTypo.labelMedium.fontFamily),
+                        style = AppTypo.labelMedium,
                         color = scheme.onSurfaceVariant,
                         modifier = Modifier.fillMaxWidth(),
                     )

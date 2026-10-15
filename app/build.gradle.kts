@@ -22,8 +22,11 @@ android {
         // Material You 动态取色需要 31+，31 以下回落设计稿的蓝色基线色
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "2.1.4"
+        // versionCode 每次发版必须递增，否则无法覆盖安装
+        versionCode = 2
+        // 2.2.0：修了一批蓝牙会话/资源释放的缺陷，并新增「连接中可取消」等行为。
+        // 加 minor 而不是 patch —— 不只是修 bug，还带了向后兼容的行为变化。
+        versionName = "2.2.0"
         vectorDrawables { useSupportLibrary = true }
     }
 

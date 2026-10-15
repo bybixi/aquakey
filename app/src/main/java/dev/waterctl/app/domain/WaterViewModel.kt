@@ -20,6 +20,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.util.Calendar
@@ -48,10 +49,10 @@ data class ControlUiState(
     val deviceName: String? = null,
     val steps: ConnectSteps = ConnectSteps(),
     val elapsedSeconds: Long = 0L,
+    /** 会话开始的绝对时刻，由 onSessionStarted 写入 —— UI 直接读，不要从 elapsed 反推 */
+    val startedAt: Long = 0L,
     val lastSession: LastSession? = null,
     val rememberedName: String? = null,
-    /** 蓝牙未开启或没有蓝牙硬件 */
-    val bluetoothUnavailable: Boolean = false,
 )
 
 data class RecordsSummary(
@@ -76,6 +77,8 @@ data class AppUiState(
     val settings: AppSettings = AppSettings(),
     val error: WaterCtlErrorInfo? = null,
     val debugLog: List<String> = emptyList(),
+    /** 选择面板是否可见。与 scanning 分开 —— 扫描超时自动停止后面板要留着展示结果 */
+    val pickerVisible: Boolean = false,
     val scanning: Boolean = false,
     val scanResults: List<WaterDevice> = emptyList(),
 )
@@ -93,7 +96,20 @@ class WaterViewModel(application: Application) : AndroidViewModel(application), 
     private var timerJob: Job? = null
     private var sessionJob: Job? = null
     private var sessionStartedAt: Long = 0L
-    private var pendingDevice: WaterDevice? = null
+    /**
+     * 本次会话的设备名。
+     *
+     * 单独存一份而不是从 `_state` 读 —— 会话中途出错时 `onError` 会把
+     * `control.deviceName` 清掉，那之后记账就取不到名字了。
+     */
+    private var sessionDeviceName: String? = null
+    /**
+     * 本次会话是否已经记过账。
+     *
+     * 会话有两条结束路径：用户点「结束」（endSession）和设备主动断开（BLE 的 B3 分支）。
+     * 两条都可能触发记账，必须防重。
+     */
+    private var sessionAccounted = false
     private var autoReconnectTried = false
 
     init {
@@ -154,8 +170,14 @@ class WaterViewModel(application: Application) : AndroidViewModel(application), 
     }
 
     fun startWith(device: WaterDevice) {
+        // 门控：会话进行中不允许再发起一次。
+        // 少了这道门，用户在 ACTIVE 时从选择器再选一台设备，就会再次 connectGatt ——
+        // gatt 字段被覆盖，旧的 BluetoothGatt 永远无法 close（连接泄漏），
+        // 而且旧设备收不到结束协议，对它来说上一次会话还在计时。
+        if (_state.value.control.stage != ControlStage.IDLE) return
+
         closePicker()
-        pendingDevice = device
+        sessionAccounted = false
         sessionJob?.cancel()
         sessionJob = viewModelScope.launch {
             _state.update {
@@ -165,19 +187,17 @@ class WaterViewModel(application: Application) : AndroidViewModel(application), 
                         deviceName = device.name,
                         steps = ConnectSteps(),
                         elapsedSeconds = 0L,
+                        startedAt = 0L,
                     ),
                 )
             }
             try {
                 ble.startSession(device.bluetoothDevice, device.name)
                 prefs.setLastDevice(device.name, device.address)
-                pendingDevice = null
             } catch (e: CancellationException) {
                 // 用户取消 / 主动断开 —— 不是错误，必须原样抛出，否则会误报给用户
-                pendingDevice = null
                 throw e
             } catch (e: Throwable) {
-                pendingDevice = null
                 if (e !is WaterCtlException) {
                     onError(WaterCtlException(WaterCtlErrorKind.UNHANDLED, e.message, e))
                 }
@@ -188,7 +208,6 @@ class WaterViewModel(application: Application) : AndroidViewModel(application), 
     fun endSession() {
         sessionJob?.cancel()
         sessionJob = viewModelScope.launch {
-            val started = sessionStartedAt
             try {
                 ble.endSession()
             } catch (e: CancellationException) {
@@ -197,37 +216,85 @@ class WaterViewModel(application: Application) : AndroidViewModel(application), 
             } catch (_: Throwable) {
                 ble.abort()
             }
-            val duration = if (started > 0L) {
-                ((System.currentTimeMillis() - started) / 1000L).toInt()
-            } else {
-                0
-            }
-            val name = _state.value.control.deviceName
-            sessionStartedAt = 0L
-            stopTimer()
-            if (duration > 0 && name != null) {
-                dao.insert(WaterRecord(startedAt = started, durationSeconds = duration, deviceName = name))
-            }
-            _state.update {
-                it.copy(
-                    control = it.control.copy(
-                        stage = ControlStage.IDLE,
-                        deviceName = null,
-                        steps = ConnectSteps(),
-                        elapsedSeconds = 0L,
+            // 正常路径由 onSessionEnded 回调记账；
+            // 这里兜底处理"设备没回应结束指令、BLE 层因此没有回调"的情况。
+            accountSession(currentSessionSeconds())
+        }
+    }
+
+    /** 连接中取消：立刻断开并复位，不上报错误。 */
+    fun cancelConnecting() {
+        if (_state.value.control.stage != ControlStage.CONNECTING) return
+        sessionJob?.cancel()
+        ble.abort()
+        sessionStartedAt = 0L
+        sessionDeviceName = null
+        sessionAccounted = true // 会话从未真正开始，不记账
+        stopTimer()
+        _state.update {
+            it.copy(
+                control = it.control.copy(
+                    stage = ControlStage.IDLE,
+                    deviceName = null,
+                    steps = ConnectSteps(),
+                    elapsedSeconds = 0L,
+                    startedAt = 0L,
+                ),
+            )
+        }
+    }
+
+    // =====================================================================
+    // 会话记账
+    // =====================================================================
+
+    /**
+     * 会话记账的**唯一入口**。
+     *
+     * 结束有两条路径 —— 用户点「结束」（走 [endSession]）和设备主动断开（走 BLE 的 `0xB3` 分支），
+     * 两条都汇聚到这里。之前只挂在 [endSession] 上，设备主动断开时记录就丢了。
+     */
+    private fun accountSession(durationSeconds: Int) {
+        if (sessionAccounted) return
+        sessionAccounted = true
+
+        val started = sessionStartedAt
+        val name = sessionDeviceName
+        sessionStartedAt = 0L
+        sessionDeviceName = null
+        stopTimer()
+
+        if (started > 0L && durationSeconds > 0 && name != null) {
+            viewModelScope.launch {
+                dao.insert(
+                    WaterRecord(
+                        startedAt = started,
+                        durationSeconds = durationSeconds,
+                        deviceName = name,
                     ),
                 )
             }
         }
+
+        _state.update {
+            it.copy(
+                control = it.control.copy(
+                    stage = ControlStage.IDLE,
+                    deviceName = null,
+                    steps = ConnectSteps(),
+                    elapsedSeconds = 0L,
+                    startedAt = 0L,
+                ),
+            )
+        }
     }
 
-    fun cancelConnecting() {
-        sessionJob?.cancel()
-        ble.abort()
-        sessionStartedAt = 0L
-        stopTimer()
-        _state.update {
-            it.copy(control = it.control.copy(stage = ControlStage.IDLE, deviceName = null, steps = ConnectSteps()))
+    private fun currentSessionSeconds(): Int {
+        val started = sessionStartedAt
+        return if (started > 0L) {
+            ((System.currentTimeMillis() - started) / 1000L).toInt()
+        } else {
+            0
         }
     }
 
@@ -241,10 +308,14 @@ class WaterViewModel(application: Application) : AndroidViewModel(application), 
      * 由 UI 在确认蓝牙权限就绪后调用 —— 权限没给就贸然连接只会弹一个无意义的错误。
      * 只尝试一次，失败不重试、不打扰用户。
      */
-    fun tryAutoReconnect() {
+    suspend fun tryAutoReconnect() {
         if (autoReconnectTried) return
         autoReconnectTried = true
-        val s = _state.value.settings
+
+        // 必须等 DataStore 的首值，而不是读 _state 里可能尚未加载的设置 ——
+        // 冷启动时触发点完全可能早于首次读盘完成，那时 lastDeviceAddress 还是 null，
+        // 而 autoReconnectTried 已经置位，结果就是"开了自动重连也永远不生效"。
+        val s = prefs.settings.first()
         if (!s.autoReconnect || !s.rememberDevice) return
         if (s.lastDeviceAddress == null) return
         if (_state.value.control.stage != ControlStage.IDLE) return
@@ -252,20 +323,23 @@ class WaterViewModel(application: Application) : AndroidViewModel(application), 
     }
 
     fun openPicker() {
-        if (!ble.hasBluetooth() || !ble.bluetoothReady()) {
-            _state.update { it.copy(control = it.control.copy(bluetoothUnavailable = true)) }
-            return
+        // 蓝牙未就绪时静默返回 —— 控制页本身受权限门控，
+        // 能走到这里就说明蓝牙是可用的。
+        if (!ble.hasBluetooth() || !ble.bluetoothReady()) return
+        _state.update {
+            it.copy(pickerVisible = true, scanning = true, scanResults = emptyList())
         }
-        _state.update { it.copy(scanning = true, scanResults = emptyList()) }
         ble.startScan(
             onUpdate = { list -> _state.update { it.copy(scanResults = list) } },
             onFailed = { _state.update { it.copy(scanning = false) } },
+            // 扫描超时自动停止：面板保持可见以展示已找到的结果，只是不再转圈
+            onStopped = { _state.update { it.copy(scanning = false) } },
         )
     }
 
     fun closePicker() {
         ble.stopScan()
-        _state.update { it.copy(scanning = false) }
+        _state.update { it.copy(pickerVisible = false, scanning = false) }
     }
 
     // =====================================================================
@@ -317,11 +391,14 @@ class WaterViewModel(application: Application) : AndroidViewModel(application), 
 
     override fun onSessionStarted(startedAt: Long) {
         sessionStartedAt = startedAt
+        sessionDeviceName = _state.value.control.deviceName
+        sessionAccounted = false
+        _state.update { it.copy(control = it.control.copy(startedAt = startedAt)) }
         startTimer()
     }
 
     override fun onSessionEnded(durationSeconds: Int) {
-        stopTimer()
+        accountSession(durationSeconds)
     }
 
     override fun onLog(line: String) {
@@ -338,18 +415,9 @@ class WaterViewModel(application: Application) : AndroidViewModel(application), 
         _state.update { it.copy(error = info) }
         if (info.fatal) {
             sessionJob?.cancel()
-            stopTimer()
-            sessionStartedAt = 0L
-            _state.update {
-                it.copy(
-                    control = it.control.copy(
-                        stage = ControlStage.IDLE,
-                        deviceName = null,
-                        steps = ConnectSteps(),
-                        elapsedSeconds = 0L,
-                    ),
-                )
-            }
+            // 会话中途失败（例如设备掉线）时这次用水是真实发生过的，
+            // 也要走记账 —— 否则用户"用了水但记录里没有"。
+            accountSession(currentSessionSeconds())
         }
     }
 

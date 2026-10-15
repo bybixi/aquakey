@@ -28,8 +28,10 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 /** 水控器使用的固定 GATT 标识。 */
 private val SERVICE_UUID: UUID = UUID.fromString("0000f1f0-0000-1000-8000-00805f9b34fb")
@@ -114,10 +116,22 @@ class WaterCtlBle(private val context: Context) {
 
     private var scanCallback: ScanCallback? = null
     private var scanTicker: Job? = null
+    private var scanTimeoutJob: Job? = null
     private var scanOnUpdate: ((List<WaterDevice>) -> Unit)? = null
-    private val found = LinkedHashMap<String, WaterDevice>()
+
+    /**
+     * 下面三个集合会被两个线程同时访问：
+     * - **写**：`onScanResult` 由系统在 binder 线程回调
+     * - **读**：`snapshot()` 由 scanTicker 在 Dispatchers.Default 上执行
+     *
+     * 所以必须用并发容器。用普通 HashMap 的话，并发读写会导致
+     * ConcurrentModificationException，极端情况下（扩容期间被读到半迁移的桶链）
+     * 会陷入死循环把 CPU 打满。
+     */
+    private val found = ConcurrentHashMap<String, WaterDevice>()
+
     /** 设备首次被发现的次序。 */
-    private val firstSeen = HashMap<String, Int>()
+    private val firstSeen = ConcurrentHashMap<String, Int>()
 
     /**
      * 排序键：**首次**发现该设备时的 RSSI。
@@ -126,7 +140,7 @@ class WaterCtlBle(private val context: Context) {
      * 用户手指落下的瞬间目标就跑了。冻结之后列表顺序一旦确定就不再变化，
      * 新设备只会在末尾追加，行不会移动。实时 RSSI 仍然显示在行里，只是不参与排序。
      */
-    private val sortKey = HashMap<String, Int>()
+    private val sortKey = ConcurrentHashMap<String, Int>()
 
     /**
      * 开始扫描。
@@ -135,7 +149,12 @@ class WaterCtlBle(private val context: Context) {
      * 因为不少水控器并不广播 0xF1F0）。这里沿用同样的策略。
      */
     @SuppressLint("MissingPermission")
-    fun startScan(onUpdate: (List<WaterDevice>) -> Unit, onFailed: (Int) -> Unit) {
+    fun startScan(
+        onUpdate: (List<WaterDevice>) -> Unit,
+        onFailed: (Int) -> Unit,
+        /** 扫描自然结束（超时）时回调；用户主动关闭面板不会触发。 */
+        onStopped: () -> Unit,
+    ) {
         if (!bluetoothReady()) return
         val scanner = adapter?.bluetoothLeScanner ?: return
         stopScan()
@@ -155,9 +174,11 @@ class WaterCtlBle(private val context: Context) {
                 if (name.isEmpty()) return
                 if (!name[0].isLetterOrDigit()) return
                 val address = result.device.address
-                if (firstSeen[address] == null) {
-                    firstSeen[address] = firstSeen.size
-                    sortKey[address] = result.rssi
+                // 上限保护：异常环境（比如教学楼里几百个蓝牙设备）下避免列表无限膨胀
+                if (found.size >= MAX_SCAN_RESULTS && !found.containsKey(address)) return
+                // putIfAbsent 而非 "读-判断-写"：并发下后者会让多个设备拿到同一个序号
+                if (firstSeen.putIfAbsent(address, firstSeen.size) == null) {
+                    sortKey.putIfAbsent(address, result.rssi)
                 }
                 found[address] = WaterDevice(name, address, result.rssi, result.device)
             }
@@ -179,6 +200,16 @@ class WaterCtlBle(private val context: Context) {
                 scanOnUpdate?.invoke(snapshot())
             }
         }
+
+        // 超时自动停止。不这么做的话面板开着会一直扫 —— 既耗电，
+        // 而且 Android 大约 30 分钟后会强制停掉未停止的扫描，
+        // 那时界面还在转圈但列表早就冻住了，用户会以为"搜不到"。
+        scanTimeoutJob = scope.launch {
+            delay(SCAN_TIMEOUT_MS)
+            scanOnUpdate?.invoke(snapshot())   // 先推一次最终结果，再停
+            stopScanInternal()
+            onStopped()
+        }
     }
 
     /**
@@ -192,6 +223,14 @@ class WaterCtlBle(private val context: Context) {
 
     @SuppressLint("MissingPermission")
     fun stopScan() {
+        scanTimeoutJob?.cancel()
+        scanTimeoutJob = null
+        stopScanInternal()
+    }
+
+    /** 停止扫描但**不**取消超时任务 —— 超时任务自己收尾时必须用这个，否则会取消掉自己。 */
+    @SuppressLint("MissingPermission")
+    private fun stopScanInternal() {
         scanTicker?.cancel()
         scanTicker = null
         scanOnUpdate = null
@@ -213,30 +252,44 @@ class WaterCtlBle(private val context: Context) {
      */
     @SuppressLint("MissingPermission")
     suspend fun startSession(device: BluetoothDevice, nameHint: String? = null) {
-        val name = device.name ?: nameHint ?: device.address
-        deviceName = name
-        startedAt = 0L
-        intentionalDisconnect = false
-        listener?.onDeviceNameChanged(name)
+        try {
+            val name = device.name ?: nameHint ?: device.address
+            deviceName = name
+            startedAt = 0L
+            intentionalDisconnect = false
+            listener?.onDeviceNameChanged(name)
 
-        setStage(ConnectionStage.CONNECTING)
-        connect(device)
-        listener?.onLog("GATT connected: $name")
+            setStage(ConnectionStage.CONNECTING)
+            connect(device)
+            listener?.onLog("GATT connected: $name")
 
-        setStage(ConnectionStage.HANDSHAKING)
-        prepareCharacteristics()
-        enableNotifications()
+            setStage(ConnectionStage.HANDSHAKING)
+            prepareCharacteristics()
+            enableNotifications()
 
-        val result = CompletableDeferred<Unit>()
-        sessionDeferred = result
+            val result = CompletableDeferred<Unit>()
+            sessionDeferred = result
 
-        write(Payloads.START_PROLOGUE)
-        armTimeout()
+            write(Payloads.START_PROLOGUE)
+            armTimeout()
 
-        val ok = withTimeoutOrNull(SESSION_WAIT_TIMEOUT_MS) { result.await() }
-        sessionDeferred = null
-        if (ok == null && !result.isCompleted) {
-            throw WaterCtlException(WaterCtlErrorKind.TIMEOUT)
+            val ok = withTimeoutOrNull(SESSION_WAIT_TIMEOUT_MS) { result.await() }
+            sessionDeferred = null
+            if (ok == null && !result.isCompleted) {
+                throw WaterCtlException(WaterCtlErrorKind.TIMEOUT)
+            }
+        } catch (e: Throwable) {
+            // 任何失败路径都必须释放 GATT。
+            // 之前清理逻辑散落在各子步骤的"成功路径"上（每个 if-throw 前手动 teardown），
+            // 异常路径会漏掉 —— 例如服务发现返回非 SUCCESS 时 servicesDeferred 被
+            // completeExceptionally，await() 直接抛异常穿透出去，连接就永远不释放了。
+            // 不要用 e.javaClass.simpleName —— release 经 R8 混淆后会变成单个字母
+            // （日志里出现"启动失败: Y"这种毫无帮助的内容）。
+            val brief = if (e is WaterCtlException) e.kind.name else (e.message ?: "未知异常")
+            log("启动失败，已释放连接（$brief）")
+            sessionDeferred = null
+            teardown()
+            throw e
         }
     }
 
@@ -247,9 +300,21 @@ class WaterCtlBle(private val context: Context) {
     suspend fun endSession() {
         val d = CompletableDeferred<Unit>()
         endDeferred = d
-        write(Payloads.END_PROLOGUE)
-        armTimeout()
-        withTimeoutOrNull(END_WAIT_TIMEOUT_MS) { d.await() }
+        try {
+            write(Payloads.END_PROLOGUE)
+            // 这里刻意【不】调 armTimeout()。
+            // 结束流程超时不应该报错 —— 用户已经按了结束，设备不回应时直接断开就行，
+            // 弹一个"等待时间太长"只会让人以为没结束成功。
+            val done = withTimeoutOrNull(END_WAIT_TIMEOUT_MS) { d.await() }
+            if (done == null) log("结束指令未收到回应，直接断开")
+        } catch (e: CancellationException) {
+            endDeferred = null
+            teardown()
+            throw e
+        } catch (e: WaterCtlException) {
+            // fail() 已经上报过错误，这里只负责收尾
+            log("结束流程异常（${e.kind}），直接断开")
+        }
         endDeferred = null
         teardown()
     }
@@ -267,6 +332,8 @@ class WaterCtlBle(private val context: Context) {
     fun release() {
         startScanStop()
         abort()
+        // 不取消 scope 的话，onCleared 之后在途的协程仍会存活并回调 listener
+        scope.cancel()
     }
 
     @SuppressLint("MissingPermission")
@@ -290,33 +357,24 @@ class WaterCtlBle(private val context: Context) {
 
         val ok = withTimeoutOrNull(CONNECT_TIMEOUT_MS) { connected.await() }
         connectedDeferred = null
-        if (ok == null) {
-            teardown()
-            throw WaterCtlException(WaterCtlErrorKind.UNSTABLE, "连接超时")
-        }
+        // 清理统一由 startSession 的 catch 负责，这里只负责报错
+        if (ok == null) throw WaterCtlException(WaterCtlErrorKind.UNSTABLE, "连接超时")
     }
 
     @SuppressLint("MissingPermission")
     private suspend fun prepareCharacteristics() {
+        // 注意：await() 可能因为 onServicesDiscovered 返回非 SUCCESS 而【抛异常】，
+        // 不只有"超时"这一种失败。清理统一由 startSession 的 catch 负责。
         val services = withTimeoutOrNull(SERVICE_TIMEOUT_MS) { servicesDeferred?.await() }
-        if (services == null) {
-            teardown()
-            throw WaterCtlException(WaterCtlErrorKind.UNSTABLE, "服务发现超时")
-        }
+        if (services == null) throw WaterCtlException(WaterCtlErrorKind.UNSTABLE, "服务发现超时")
 
         val g = gatt ?: throw WaterCtlException(WaterCtlErrorKind.UNSTABLE)
         val service = g.getService(SERVICE_UUID)
-            ?: run {
-                teardown()
-                throw WaterCtlException(WaterCtlErrorKind.UNSUPPORTED_MODEL)
-            }
+            ?: throw WaterCtlException(WaterCtlErrorKind.UNSUPPORTED_MODEL)
 
         txd = service.getCharacteristic(TXD_UUID)
         rxd = service.getCharacteristic(RXD_UUID)
-        if (txd == null || rxd == null) {
-            teardown()
-            throw WaterCtlException(WaterCtlErrorKind.UNSUPPORTED_MODEL)
-        }
+        if (txd == null || rxd == null) throw WaterCtlException(WaterCtlErrorKind.UNSUPPORTED_MODEL)
     }
 
     @SuppressLint("MissingPermission")
@@ -325,7 +383,6 @@ class WaterCtlBle(private val context: Context) {
         val r = rxd ?: throw WaterCtlException(WaterCtlErrorKind.UNSUPPORTED_MODEL)
 
         if (!g.setCharacteristicNotification(r, true)) {
-            teardown()
             throw WaterCtlException(WaterCtlErrorKind.UNSUPPORTED_MODEL)
         }
 
@@ -345,12 +402,12 @@ class WaterCtlBle(private val context: Context) {
             }
             if (!written) {
                 descriptorDeferred = null
-                teardown()
                 throw WaterCtlException(WaterCtlErrorKind.UNSUPPORTED_MODEL)
             }
             withTimeoutOrNull(DESCRIPTOR_TIMEOUT_MS) { d.await() }
             descriptorDeferred = null
-            // 描述符写失败不致命：部分机型仍能收到通知，原版也没有这一步。
+            // 这里超时也继续往下走 —— 不写 CCCD 是收不到通知的，
+            // 但后续 15 秒的响应超时会统一兜底报错，不需要在这里额外处理。
         }
     }
 
@@ -412,6 +469,9 @@ class WaterCtlBle(private val context: Context) {
 
     private fun fail(error: WaterCtlException) {
         sessionDeferred?.completeExceptionally(error)
+        // 结束会话时等的是 endDeferred。不一并 complete 的话，
+        // 断开过程中的失败要让 endSession 一直挂到 20 秒超时才收尾。
+        endDeferred?.completeExceptionally(error)
         listener?.onError(error)
     }
 
@@ -439,99 +499,16 @@ class WaterCtlBle(private val context: Context) {
     private suspend fun handleNotification(raw: ByteArray) {
         log("RXD: " + hex(raw))
         try {
-            var payload = raw
-            if (payload.isEmpty()) return
-
-            // 固件 bug：有时会主动发一条 AT 命令，直接忽略
-            if (payload.size >= 3 &&
-                payload[0].toInt() == 0x41 &&
-                payload[1].toInt() == 0x54 &&
-                payload[2].toInt() == 0x2b
-            ) {
-                return
-            }
-
-            val first = payload[0].toInt() and 0xFF
-            if (first != 0xFD && first != 0x09) {
-                throw WaterCtlException(WaterCtlErrorKind.UNKNOWN_RX)
-            }
-
-            // 固件 bug：偶尔丢掉前 1~2 个字节，这里补回来
-            // （原版靠 JS 越界读 undefined 自然跳过，Kotlin 里必须显式判长）
-            if (payload.size >= 2 && (payload[1].toInt() and 0xFF) == 0x09) {
-                payload = byteArrayOf(0xFD.toByte()) + payload
-            }
-            if ((payload[0].toInt() and 0xFF) == 0x09) {
-                payload = byteArrayOf(0xFD.toByte(), 0xFD.toByte()) + payload
-            }
-
-            if (payload.size < 4) return
-
-            when (payload[3].toInt() and 0xFF) {
-                // 启动前导已被接受。老固件到此为止；新固件会在 500ms 内发 AE，
-                // 所以这里的延迟发送必须可被取消（与原版 pendingStartEpilogue 同理）。
-                0xB0, 0xB1 -> {
-                    startEpilogueJob?.cancel()
-                    startEpilogueJob = scope.launch {
-                        delay(500)
-                        setStage(ConnectionStage.STARTING)
-                        write(Solvers.makeStartEpilogue(deviceName))
-                    }
-                }
-
-                // 新固件的密钥认证请求
-                0xAE -> {
-                    startEpilogueJob?.cancel()
-                    setStage(ConnectionStage.STARTING)
-                    write(Solvers.makeUnlockResponse(payload, deviceName))
-                }
-
-                // 密钥认证结果
-                0xAF -> {
-                    val code = if (payload.size > 5) payload[5].toInt() and 0xFF else -1
-                    when (code) {
-                        0x55 -> write(Solvers.makeStartEpilogue(deviceName, isKeyAuthPresent = true))
-                        0x01, 0x02, 0x04 -> throw WaterCtlException(WaterCtlErrorKind.REFUSED)
-                        else -> {
-                            write(Solvers.makeStartEpilogue(deviceName, isKeyAuthPresent = true))
-                            throw WaterCtlException(WaterCtlErrorKind.UNKNOWN_RX)
-                        }
-                    }
-                }
-
-                // 启动成功
-                0xB2 -> {
-                    startEpilogueJob?.cancel()
-                    cancelTimeout()
-                    startedAt = System.currentTimeMillis()
-                    setStage(ConnectionStage.ACTIVE)
-                    listener?.onSessionStarted(startedAt)
-                    sessionDeferred?.complete(Unit)
-                }
-
-                // 结束前导已被接受：回 endEpilogue 然后断开
-                0xB3 -> {
-                    runCatching { write(Payloads.END_EPILOGUE) }
-                    intentionalDisconnect = true
-                    teardown()
-                    endDeferred?.complete(Unit)
-                    listener?.onSessionEnded(0)
-                }
-
-                // 遥测 / 温度设置 / 未知 —— 均无需回应
-                0xAA, 0xB5, 0xB8 -> Unit
-
-                // 用户信息上传请求：回执但我们永远不会真的上传
-                0xBA -> write(Payloads.BA_ACK)
-
-                // 上一次未完成的离线会话残留
-                0xBC -> write(Payloads.OFFLINE_BOMB_FIX)
-
-                // 启动被拒
-                0xC8 -> throw WaterCtlException(WaterCtlErrorKind.REFUSED)
-
-                else -> throw WaterCtlException(WaterCtlErrorKind.UNKNOWN_RX)
-            }
+            // 判定与执行分开：reactToNotification 是纯函数（见 RxReaction.kt），
+            // 可以被单测完整覆盖；这里只负责把判定结果落到真实设备上。
+            execute(
+                reactToNotification(
+                    raw = raw,
+                    deviceName = deviceName,
+                    startedAt = startedAt,
+                    now = System.currentTimeMillis(),
+                ),
+            )
         } catch (e: WaterCtlException) {
             fail(e)
         } catch (e: CancellationException) {
@@ -539,6 +516,61 @@ class WaterCtlBle(private val context: Context) {
             throw e
         } catch (e: Throwable) {
             fail(WaterCtlException(WaterCtlErrorKind.UNHANDLED, e.message, e))
+        }
+    }
+
+    /** 执行判定结果。这里只做副作用，不含任何分支判断。 */
+    private suspend fun execute(rx: RxReaction) {
+        when (rx) {
+            RxReaction.Ignore, RxReaction.Malformed -> Unit
+
+            is RxReaction.Write -> {
+                rx.stage?.let { setStage(it) }
+                write(rx.data)
+            }
+
+            is RxReaction.WriteStartEpilogue -> {
+                startEpilogueJob?.cancel()
+                if (rx.delayMs <= 0L) {
+                    setStage(ConnectionStage.STARTING)
+                    write(Solvers.makeStartEpilogue(deviceName, rx.keyAuth))
+                } else {
+                    // 延迟期间可能收到 AE（新固件），届时要能取消 —— 所以必须走 job
+                    startEpilogueJob = scope.launch {
+                        delay(rx.delayMs)
+                        setStage(ConnectionStage.STARTING)
+                        write(Solvers.makeStartEpilogue(deviceName, rx.keyAuth))
+                    }
+                }
+            }
+
+            is RxReaction.WriteStartEpilogueThenFail -> {
+                startEpilogueJob?.cancel()
+                setStage(ConnectionStage.STARTING)
+                write(Solvers.makeStartEpilogue(deviceName, isKeyAuthPresent = true))
+                throw WaterCtlException(rx.kind)
+            }
+
+            is RxReaction.Ready -> {
+                startEpilogueJob?.cancel()
+                cancelTimeout()
+                startedAt = rx.startedAt
+                setStage(ConnectionStage.ACTIVE)
+                listener?.onSessionStarted(rx.startedAt)
+                sessionDeferred?.complete(Unit)
+            }
+
+            is RxReaction.Ended -> {
+                runCatching { write(Payloads.END_EPILOGUE) }
+                // 会话可能是设备主动结束的（此时 endDeferred 为 null，
+                // endSession() 根本没被调用），所以时长已在判定阶段算好并带过来。
+                intentionalDisconnect = true
+                teardown()
+                endDeferred?.complete(Unit)
+                listener?.onSessionEnded(rx.durationSeconds)
+            }
+
+            is RxReaction.Fail -> throw WaterCtlException(rx.kind)
         }
     }
 
@@ -636,6 +668,12 @@ class WaterCtlBle(private val context: Context) {
     companion object {
         /** 扫描结果推送到界面的最小间隔 —— 太快会导致列表跳动、点不中目标。 */
         private const val SCAN_UI_INTERVAL_MS = 1_000L
+
+        /** 扫描最长持续时间，到点自动停止（省电，也避免被系统强制中断后界面假死）。 */
+        private const val SCAN_TIMEOUT_MS = 30_000L
+
+        /** 扫描列表上限，异常环境（教学楼里几百个蓝牙设备）下防止无限膨胀。 */
+        private const val MAX_SCAN_RESULTS = 50
 
         private const val CONNECT_TIMEOUT_MS = 15_000L
         private const val SERVICE_TIMEOUT_MS = 8_000L

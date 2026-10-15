@@ -69,7 +69,9 @@ internal object Solvers {
      * 布局：`[unknownByte][newNonce:2][key:4][FE 87 00 00][00 00 00 00]`，前面再加 1 字节校验和。
      */
     fun makeUnlockResponse(unlockRequest: ByteArray, deviceName: String): ByteArray {
-        require(unlockRequest.size >= 10) { "WATERCTL INTERNAL Bad unlock request" }
+        // 用语义化异常而不是 require —— 后者会以 IllegalArgumentException 冒到用户面前，
+        // 弹窗里就会出现 "java.lang.IllegalArgumentException: WATERCTL INTERNAL ..." 这种东西。
+        if (unlockRequest.size < 10) throw WaterCtlException(WaterCtlErrorKind.UNKNOWN_RX)
 
         val unknownByte = unlockRequest[5].toInt() and 0xFF
         val nonceHi = unlockRequest[6].toInt() and 0xFF

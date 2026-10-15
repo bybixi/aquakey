@@ -11,9 +11,6 @@ interface WaterRecordDao {
     @Query("SELECT * FROM water_records ORDER BY startedAt DESC")
     fun observeAll(): Flow<List<WaterRecord>>
 
-    @Query("SELECT * FROM water_records ORDER BY startedAt DESC LIMIT 1")
-    suspend fun latest(): WaterRecord?
-
     @Insert
     suspend fun insert(record: WaterRecord): Long
 

@@ -102,7 +102,11 @@ object ErrorResolver {
         WaterCtlErrorKind.UNHANDLED -> WaterCtlErrorInfo(
             kind = kind,
             title = "出现错误",
-            message = "${error ?: "未知错误"}\n\n这可能是一个 Bug，请把下面的调试信息反馈给开发者。",
+            // 不直接拼 error.toString() —— 那会把内部类名（如
+            // "java.lang.IllegalStateException: ..."）暴露给用户。
+            // 真正的细节在下面的调试日志里，需要时再看。
+            message = "发生了未预期的错误。\n\n这可能是一个 Bug，" +
+                "请把下面的调试信息反馈给开发者。",
             fatal = true,
             showLogs = true,
         )

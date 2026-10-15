@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 12+ 的备份 / 迁移策略。
+
+  显式声明而不是依赖系统默认 —— 默认行为是"把大部分应用数据都传上去"，
+  那是隐式的，出问题时无从追溯。
+
+  本应用只有两类持久化数据：
+    · waterctl.db   本地用水记录（开始时间、时长、设备名）
+    · datastore/    设置项 + 上次连接的水控器地址
+
+  两者都不敏感，且备份对用户有实际好处（换手机后用水记录与"上次连接"都还在），
+  所以这里选择全部纳入。如果将来加入任何个人身份信息，请在此处排除。
+-->
+<data-extraction-rules>
+
+    <!-- 云端备份（Google Drive） -->
+    <cloud-backup>
+        <include
+            domain="database"
+            path="waterctl.db" />
+        <include
+            domain="file"
+            path="datastore/" />
+    </cloud-backup>
+
+    <!-- 换机直传（设备到设备） -->
+    <device-transfer>
+        <include
+            domain="database"
+            path="waterctl.db" />
+        <include
+            domain="file"
+            path="datastore/" />
+    </device-transfer>
+
+</data-extraction-rules>

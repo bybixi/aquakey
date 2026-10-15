@@ -109,6 +109,7 @@ fun AppRoot(vm: WaterViewModel, modifier: Modifier = Modifier) {
                         onMainAction = vm::onMainAction,
                         onPickDevice = vm::openPicker,
                         onReconnect = vm::beginSession,
+                        onCancel = vm::cancelConnecting,
                     )
                 } else {
                     PermissionScreen(
@@ -176,7 +177,9 @@ fun AppRoot(vm: WaterViewModel, modifier: Modifier = Modifier) {
         )
     }
 
-    if (state.scanning) {
+    // 用 pickerVisible 而不是 scanning —— 扫描超时自动停止后，
+    // 面板要留在屏幕上展示已找到的设备，不能跟着消失。
+    if (state.pickerVisible) {
         DevicePickerSheet(
             scanning = state.scanning,
             devices = state.scanResults,

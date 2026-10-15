@@ -52,6 +52,7 @@ fun ControlScreen(
     onMainAction: () -> Unit,
     onPickDevice: () -> Unit,
     onReconnect: () -> Unit,
+    onCancel: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -66,6 +67,9 @@ fun ControlScreen(
                 CircleIconButton(
                     icon = Icons.Outlined.Bluetooth,
                     contentDescription = "选择水控器",
+                    // 会话进行中不允许换设备 —— 否则会重复 connectGatt，
+                    // 旧连接永远无法释放，且旧水控器收不到结束协议。
+                    enabled = state.stage == ControlStage.IDLE,
                     onClick = onPickDevice,
                 )
             },
@@ -82,7 +86,7 @@ fun ControlScreen(
         ) {
             when (state.stage) {
                 ControlStage.IDLE -> IdleContent(state, onMainAction, onReconnect)
-                ControlStage.CONNECTING -> ConnectingContent(state)
+                ControlStage.CONNECTING -> ConnectingContent(state, onCancel)
                 ControlStage.ACTIVE -> ActiveContent(state, onMainAction)
             }
         }
@@ -182,7 +186,7 @@ private fun IdleContent(
 // =====================================================================
 
 @Composable
-private fun ConnectingContent(state: ControlUiState) {
+private fun ConnectingContent(state: ControlUiState, onCancel: () -> Unit) {
     val scheme = MaterialTheme.colorScheme
 
     StatusChip(
@@ -195,11 +199,12 @@ private fun ConnectingContent(state: ControlUiState) {
     Spacer(Modifier.height(Dimens.controlGap))
 
     HeroButton(
-        label = "请稍候",
+        // 之前这里是「请稍候」且不可点 —— 误连了别的设备只能干等 15 秒超时。
+        // 现在同一个按钮直接变成「取消」。
+        label = "取消",
         containerColor = scheme.surfaceContainerHighest,
         contentColor = scheme.onSurfaceVariant,
-        enabled = false,
-        onClick = {},
+        onClick = onCancel,
     ) {
         CircularProgressIndicator(
             modifier = Modifier.size(Dimens.heroIconSize),
@@ -212,7 +217,8 @@ private fun ConnectingContent(state: ControlUiState) {
     Spacer(Modifier.height(Dimens.controlGap))
 
     Text(
-        text = "正在建立连接并校验密钥，请勿离开",
+        // 去掉了「请勿离开」——现在有取消按钮了，那句话和它矛盾
+        text = "正在建立连接并校验密钥",
         style = AppTypo.bodySmall,
         color = scheme.onSurfaceVariant,
         textAlign = TextAlign.Center,
@@ -317,13 +323,8 @@ private fun ActiveContent(state: ControlUiState, onMainAction: () -> Unit) {
 
     InfoCard {
         Text("本次会话", style = AppTypo.labelMedium, color = scheme.onSurfaceVariant)
-        Text("开始时间 · ${Fmt.timeOfDay(sessionStartOf(state))}", style = AppTypo.bodySmall, color = scheme.onSurface)
+        Text("开始时间 · ${Fmt.timeOfDay(state.startedAt)}", style = AppTypo.bodySmall, color = scheme.onSurface)
         Text("水控器 · ${state.deviceName ?: "—"}", style = AppTypo.bodySmall, color = scheme.onSurface)
     }
 }
 
-/**
- * 会话开始时刻。ViewModel 用 elapsed 反推，避免这里多引一个状态。
- */
-private fun sessionStartOf(state: ControlUiState): Long =
-    System.currentTimeMillis() - state.elapsedSeconds * 1000L

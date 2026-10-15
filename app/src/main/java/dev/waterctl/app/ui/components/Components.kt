@@ -86,19 +86,22 @@ fun CircleIconButton(
     icon: ImageVector,
     contentDescription: String?,
     onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
     tint: Color = MaterialTheme.colorScheme.onSurfaceVariant,
 ) {
     Box(
-        modifier = Modifier
+        modifier = modifier
             .size(Dimens.iconButtonSize)
             .clip(CircleShape)
-            .clickable(onClick = onClick),
+            .then(if (enabled) Modifier.clickable(onClick = onClick) else Modifier),
         contentAlignment = Alignment.Center,
     ) {
         Icon(
             imageVector = icon,
             contentDescription = contentDescription,
-            tint = tint,
+            // 禁用态降到 38% 不透明度，保持 Material 的禁用语义
+            tint = if (enabled) tint else tint.copy(alpha = 0.38f),
             modifier = Modifier.size(Dimens.iconButtonIcon),
         )
     }

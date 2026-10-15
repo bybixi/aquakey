@@ -101,6 +101,14 @@ fun DevicePickerSheet(
                         .heightIn(max = 320.dp),
                     verticalArrangement = Arrangement.spacedBy(Dimens.listGapTight),
                 ) {
+                    item {
+                        Text(
+                            text = if (scanning) "正在搜索…" else "搜索已结束 · 点按设备即可连接",
+                            style = AppTypo.label,
+                            color = scheme.onSurfaceVariant,
+                            modifier = Modifier.padding(bottom = 2.dp),
+                        )
+                    }
                     items(devices, key = { it.address }) { device ->
                         Row(
                             modifier = Modifier
